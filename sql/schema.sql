@@ -1,6 +1,11 @@
+-- LEGACY!! now using alembic
+
+
+
 -- IG Graph POC schema
 -- Simplified from the full design: no partitioning, no sharding, just enough
 -- to prove the priority-driven crawl loop works end to end.
+
 
 CREATE TABLE IF NOT EXISTS users (
     id                      BIGSERIAL PRIMARY KEY,

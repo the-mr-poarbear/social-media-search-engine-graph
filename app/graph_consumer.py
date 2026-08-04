@@ -41,15 +41,17 @@ from app.db import CrawlQueue, Edge, SessionLocal, User
 from app.enrichment import lookup_follower_count
 from app.kafka_client import make_consumer
 from app.priority import compute_priority
+from app.proxy_pool import ProxyPool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [graph-consumer] %(message)s")
 log = logging.getLogger(__name__)
 
 
-async def process_page(http_client: httpx.AsyncClient, session, page: dict):
+async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, session, page: dict):
     source_user_id = page["source_user_id"]
     for acc in page["accounts"]:
         username = acc["username"]
+        is_private = acc["is_private"]
 
         # Look up first; if new, always insert a row into `users` regardless
         # of follower count — we want the full set of discovered accounts on
@@ -58,21 +60,39 @@ async def process_page(http_client: httpx.AsyncClient, session, page: dict):
         # actually balloon toward 1B+ rows if we recorded every following
         # relationship instead of just the ones to accounts worth crawling.
         user = (await session.execute(select(User).where(User.username == username))).scalar_one_or_none()
+        enrichment = None
+        crawl_state = user.crawl_state if user else None
 
-        if user is None:
+        if user is None or crawl_state is None or crawl_state == "enrichment_failed":
             try:
-                enrichment = await lookup_follower_count(http_client, username)
+                if not is_private:
+                    enrichment = await lookup_follower_count(http_client, proxy_pool , username)
+                    crawl_state = "never_crawled"
             except httpx.HTTPError as e:
                 log.warning("hypeauditor lookup failed for %s: %s", username, e)
+                enrichment = None
+                crawl_state = "enrichment_failed"
+                
+            if enrichment is None and not is_private:
+                log.warning("No HypeAuditor match for %s", username)
+                crawl_state = "skipped_below_threshold"
+                # continue
+            elif enrichment is None and is_private:
+                log.info("Private account %s, skipping enrichment", username)
+                crawl_state = "never_crawled"
                 enrichment = None
 
             stmt = (
                 pg_insert(User)
                 .values(
-                    insta_id=enrichment["insta_id"],
+                    insta_id=acc["insta_id"],
                     username=username,
                     follower_count=enrichment["follower_count"] if enrichment else None,
-                    is_verified=enrichment["is_verified"] if enrichment else None,
+                    is_verified=acc["is_verified"] ,
+                    name=acc["name"] ,
+                    is_private=is_private,
+                    discovered_by=source_user_id,
+                    crawl_state=crawl_state,
                 )
                 .on_conflict_do_nothing(index_elements=["username"])
                 .returning(User)
@@ -84,8 +104,13 @@ async def process_page(http_client: httpx.AsyncClient, session, page: dict):
                 # lost a race to another consumer instance inserting the same user
                 user = (await session.execute(select(User).where(User.username == username))).scalar_one()
 
+        
+
         if (user.follower_count or 0) < settings.follower_threshold:
-            continue  # row stays in `users`, but no edge, no discovery_score, no queueing
+            user.discovery_score = (user.discovery_score or 0) + 1
+            await session.merge(user)
+            await session.commit()
+            continue  # row stays in `users`, but no edge, no queueing, only discovery_score
 
         # Threshold cleared. Insert the edge and check whether it was
         # actually new. Kafka gives at-least-once delivery — if this
@@ -113,15 +138,15 @@ async def process_page(http_client: httpx.AsyncClient, session, page: dict):
         if user.crawl_state is not None and user.crawl_state != "never_crawled":
             continue  # already crawled or in flight, don't re-enqueue
 
-        existing_queue = (
-            await session.execute(
-                select(CrawlQueue).where(
-                    CrawlQueue.user_id == user.id, CrawlQueue.status.in_(["pending", "processing"])
-                )
-            )
-        ).scalar_one_or_none()
-        if existing_queue:
-            continue
+        # existing_queue = (
+        #     await session.execute(
+        #         select(CrawlQueue).where(
+        #             CrawlQueue.user_id == user.id, CrawlQueue.status.in_(["pending", "processing"])
+        #         )
+        #     )
+        # ).scalar_one_or_none()
+        # if existing_queue:
+        #     continue
 
         priority = compute_priority(user.follower_count, user.seed_association_score, user.discovery_score)
         session.add(
@@ -140,11 +165,13 @@ async def run():
     consumer = make_consumer(settings.topic_following_pages, group_id="graph-consumers")
     await consumer.start()
     async with httpx.AsyncClient(timeout=10.0) as http_client:
+        proxy_pool = ProxyPool()
+        await proxy_pool.refresh(http_client) 
         try:
             async for msg in consumer:
                 page = msg.value
                 async with SessionLocal() as session:
-                    await process_page(http_client, session, page)
+                    await process_page(http_client, proxy_pool ,session, page)
                 await consumer.commit()
                 log.info(
                     "processed page %d from %s (%d accounts)",

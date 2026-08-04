@@ -11,7 +11,10 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      # schema is no longer auto-applied here — run `alembic upgrade head`
+      # after the container is up (see README). Keeping schema.sql around
+      # under sql/ purely as a human-readable reference of the current
+      # shape; alembic/versions/ is the actual source of truth now.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U igpoc"]
       interval: 5s
@@ -41,11 +44,14 @@ services:
       - --overprovisioned
       - --node-id=0
       - --check=false
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
     ports:
-      - "9092:9092"
+      - "9092:9092"     # internal listener — used by other containers (e.g. redpanda-console)
+      - "19092:19092"   # external listener — use THIS one from host-run Python processes
       - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
 
   redpanda-console:
     image: docker.redpanda.com/redpandadata/console:v2.6.0
@@ -59,3 +65,4 @@ services:
 volumes:
   pgdata:
   pgadmin-data:
+  redpanda_data:

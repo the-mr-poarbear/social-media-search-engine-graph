@@ -1,5 +1,8 @@
-username,name,category,country,follower_count,seed_association_score
-cristiano,Cristiano Ronaldo,Sports,Portugal,650000000,3
-leomessi,Leo Messi,Sports,Argentina,500000000,3
-nasa,NASA,Science,USA,100000000,2
-natgeo,National Geographic,Media,USA,280000000,2
+insta_id,username,name,category,country,follower_count,seed_association_score
+1436859892,iamcardib,Cardi B,Entertainment,USA,164200000,10
+173560420,cristiano,Cristiano Ronaldo,Sports,Portugal,678147602,10
+427553890,leomessi,Leo Messi,Sports,Argentina,515603362,10
+528817151,nasa,NASA,Science,USA,104255219,10
+787132,natgeo,National Geographic,Media,USA,268897166,10
+305701719,jlo,Jennifer Lopez,Entertainment,USA,240510155,10
+14455831,champagnepapi,champagnepapi,Entertainment,Canada,139850137,10

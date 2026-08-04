@@ -25,25 +25,95 @@ that behaves correctly against your own account before trusting it for
 anything.
 """
 
+import logging
 import httpx
+import asyncio
+import random
+from app.adaptive_delay import AdaptiveDelay
+from app.proxy_pool import ProxyPool
+from app.config import settings
+import socksio.exceptions
+
+
+log = logging.getLogger(__name__)
+
 
 HYPEAUDITOR_SUGGEST_URL = "https://pdata.hypeauditor.com/suggest/"
 
+adaptive_delay = AdaptiveDelay(
+    target=settings.enrich_target_interval,
+    initial_sleep=settings.enrich_max_sleep
+)
 
-async def lookup_follower_count(client: httpx.AsyncClient, username: str) -> dict | None:
-    """Returns {follower_count, is_verified, is_private, hypeauditor_user_id} or None if not found."""
-    resp = await client.get(
-        HYPEAUDITOR_SUGGEST_URL,
-        params={"search": username, "st": "ig", "excl_st": "sn"},
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    for item in data.get("list", []):
-        if item.get("username", "").lower() == username.lower():
-            return {
-                "follower_count": item.get("followers_count"),
-                "is_verified": item.get("is_verified"),
-                "is_private": item.get("is_private"),
-                "insta_id": item.get("user_id"),
-            }
+
+async def lookup_follower_count(
+    http_client: httpx.AsyncClient,
+    proxy_pool: ProxyPool,
+    username: str,
+    max_attempts: int = 3,
+) -> dict | None:
+    """Returns {follower_count, is_verified, is_private, hypeauditor_user_id} or None if not found.
+
+    http_client is used unproxied for two things: refreshing the proxy list
+    itself, and as a last-resort fallback if the pool has no available
+    proxy right now (all benched) — better to occasionally eat a direct
+    request than to fail the lookup outright.
+    """
+    params = {"search": username, "st": "ig", "excl_st": "sn"}
+
+    for attempt in range(max_attempts):
+        proxy = await proxy_pool.get_proxy(http_client)
+        # await asyncio.sleep(random.uniform(10, 10))
+        await adaptive_delay.wait()
+        start = asyncio.get_event_loop().time()
+
+        try:
+            if proxy is None:
+                resp = await http_client.get(HYPEAUDITOR_SUGGEST_URL, params=params)
+            else:
+                proxied_client = proxy_pool.get_client_for(proxy)
+                resp = await proxied_client.get(HYPEAUDITOR_SUGGEST_URL, params=params)
+            resp.raise_for_status()
+
+            
+            response_time = asyncio.get_event_loop().time() - start
+            total_time = adaptive_delay.sleep_time + response_time
+            adaptive_delay.record(total_time)
+
+        except httpx.HTTPError as e:
+            if proxy is not None:
+                should_release = proxy.record_failure()
+
+                if should_release:
+                    proxy_pool.release_proxy(proxy)    
+                    
+            log.warning("attempt %d/%d failed for %s via %s: %s",
+                        attempt + 1, max_attempts, username, proxy.url if proxy else "direct", e)
+            continue
+
+        except (socksio.exceptions.ProtocolError) as e:
+            log.warning(
+                "Proxy %s returned malformed SOCKS reply, removing immediately.",
+                proxy.url,
+            )
+            # proxy.benched_until = time.monotonic() + BENCH_SECONDS
+            proxy.record_failure()
+            proxy_pool.release_proxy(proxy)
+            
+        if proxy is not None:
+            proxy.record_success()
+
+        data = resp.json()
+        for item in data.get("list", []):
+            if item.get("username", "").lower() == username.lower():
+                return {
+                    "follower_count": item.get("followers_count"),
+                    "is_verified": item.get("is_verified"),
+                    "is_private": item.get("is_private"),
+                    "insta_id": int(item.get("user_id")),
+                    "name": item.get("full_name"),     
+                }
+        return None  # request succeeded, username just wasn't in the results
+
+    log.warning("all %d attempts exhausted for %s", max_attempts, username)
     return None

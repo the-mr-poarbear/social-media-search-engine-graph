@@ -28,8 +28,7 @@ BASE_URL = "https://i.instagram.com/api/v1"
 WEB_BASE_URL = "https://www.instagram.com/api/v1"
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 )
 
 
@@ -58,9 +57,9 @@ class FollowedAccount:
 
 class InstagramSession:
     def __init__(self):
-        if not (settings.ig_sessionid and settings.ig_csrftoken and settings.ig_ds_user_id):
+        if not (settings.ig_sessionid and settings.doc_id and settings.fb_dtsg):
             raise RuntimeError(
-                "Missing IG_SESSIONID / IG_CSRFTOKEN / IG_DS_USER_ID env vars. "
+                "Missing IG_SESSIONID / DOC_ID / FB_DTSG env vars. "
                 "Pull these from your browser's cookie jar for instagram.com "
                 "while logged in, then export them before running a worker."
             )
@@ -80,6 +79,7 @@ class InstagramSession:
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Connection': 'keep-alive',
                 "Referer": "https://www.instagram.com/",
+                'x-ig-app-id': settings.ig_app_id,
             },
             cookies={
                 "sessionid": settings.ig_sessionid,
@@ -141,13 +141,12 @@ class InstagramSession:
         }
 
     async def get_following_page(
-        self, insta_id: int, page: int | None = None
+        self, insta_id: int, page: int | None = None , count: int = 200
     ) -> tuple[list[FollowedAccount], str | None]:
         """One page (~200 accounts) of who `insta_id` follows.
 
         Returns (accounts, next_max_id). next_max_id is None when done.
         """
-        count = 200 
         params = {"count": count}
         if page and page > 1:
             params["max_id"] = (page -1) * count 

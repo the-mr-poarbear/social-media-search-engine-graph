@@ -137,30 +137,49 @@ async def handle_job(ig: InstagramSession, producer, job: dict):
             #         return
 
             page_num = 0
+            page_size = 200
+            chunk_size = settings.worker_message_size
+            
             while True:
-                accounts, hasmore = await ig.get_following_page(insta_id, page=page_num )
+                accounts, hasmore = await ig.get_following_page(insta_id, page=page_num , count=page_size )
+
+
+                for chunk_index, start in enumerate(range(0, len(accounts), chunk_size)):
+                    chunk = accounts[start:start + chunk_size]
+
+                    await producer.send_and_wait(
+                        settings.topic_following_pages,
+                        {
+                            "source_user_id": user_id,
+                            "source_username": username,
+                            "source_insta_id": insta_id,
+                            "instagram_page": page_num,
+                            "chunk_index": chunk_index,
+                            "message_id": f"{insta_id}:{page_num}:{chunk_index}",
+                            "accounts": [
+                                {
+                                    "insta_id": a.insta_id,
+                                    "username": a.username,
+                                    "name": a.name,
+                                    "is_verified": a.is_verified,
+                                    "profile_pic": a.profile_pic,
+                                    "is_private": a.is_private,
+                                }
+                                for a in chunk
+                            ],
+                        },
+                    )
+                    log.info(
+                        "%s: instagram_page=%d chunk=%d accounts=%d done=%s",
+                        username,
+                        page_num,
+                        chunk_index,
+                        len(chunk),
+                        not hasmore
+                    )
+
                 page_num += 1
-                await producer.send_and_wait(
-                    settings.topic_following_pages,
-                    {
-                        "source_user_id": user_id,
-                        "source_username": username,
-                        "source_insta_id": insta_id,
-                        "page_num": page_num,
-                        "accounts": [
-                            {
-                                "insta_id": a.insta_id,
-                                "username": a.username,
-                                "name": a.name,
-                                "is_verified": a.is_verified,
-                                "profile_pic": a.profile_pic,
-                                "is_private": a.is_private,
-                            }
-                            for a in accounts
-                        ],
-                    },
-                )
-                log.info("%s: page %d, %d accounts, done=%s", username, page_num, len(accounts), not hasmore)
+
                 if not hasmore:
                     break
 
