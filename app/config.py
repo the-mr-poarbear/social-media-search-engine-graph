@@ -47,4 +47,15 @@ class Settings:
     worker_message_size: int = int(os.getenv("WORKER_MESSAGE_SIZE", "10"))
 
 
+    neo4j_uri: str = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+    neo4j_user: str = os.getenv("NEO4J_USER", "neo4j")
+    neo4j_password: str = os.getenv("NEO4J_PASSWORD", "your_password_here")
+
+    batch_size: int = int(os.getenv("BATCH_SIZE", "5000"))
+
+
+ 
+
+
+
 settings = Settings()

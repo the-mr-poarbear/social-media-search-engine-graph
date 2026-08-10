@@ -4,3 +4,4 @@ aiokafka>=0.11
 alembic>=1.13
 python-dotenv>=1.0
 httpx[socks]
+neo4j==5.24.0

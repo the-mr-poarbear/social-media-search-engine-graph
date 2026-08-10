@@ -52,6 +52,7 @@ async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, se
     for acc in page["accounts"]:
         username = acc["username"]
         is_private = acc["is_private"]
+        profile_pic = acc["profile_pic"]
 
         # Look up first; if new, always insert a row into `users` regardless
         # of follower count — we want the full set of discovered accounts on
@@ -66,7 +67,7 @@ async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, se
         if user is None or crawl_state is None or crawl_state == "enrichment_failed":
             try:
                 if not is_private:
-                    enrichment = await lookup_follower_count(http_client, proxy_pool , username)
+                    enrichment , exhausted_retries = await lookup_follower_count(http_client, proxy_pool , username)
                     crawl_state = "never_crawled"
             except httpx.HTTPError as e:
                 log.warning("hypeauditor lookup failed for %s: %s", username, e)
@@ -74,8 +75,12 @@ async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, se
                 crawl_state = "enrichment_failed"
                 
             if enrichment is None and not is_private:
-                log.warning("No HypeAuditor match for %s", username)
-                crawl_state = "skipped_below_threshold"
+                if exhausted_retries:
+                    crawl_state = "enrichment_failed"
+                    log.warning("request exhausted for %s", username)
+                else:
+                    crawl_state = "not_present_in_enrichment_list"
+                    log.warning("No HypeAuditor match for %s", username)
                 # continue
             elif enrichment is None and is_private:
                 log.info("Private account %s, skipping enrichment", username)
@@ -93,6 +98,7 @@ async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, se
                     is_private=is_private,
                     discovered_by=source_user_id,
                     crawl_state=crawl_state,
+                    profile_pic=profile_pic
                 )
                 .on_conflict_do_nothing(index_elements=["username"])
                 .returning(User)
@@ -174,8 +180,8 @@ async def run():
                     await process_page(http_client, proxy_pool ,session, page)
                 await consumer.commit()
                 log.info(
-                    "processed page %d from %s (%d accounts)",
-                    page["page_num"], page["source_username"], len(page["accounts"]),
+                    "processed chunck %d of page %d from %s (%d accounts)",
+                    page["chunk_index"], page["instagram_page"], page["source_username"], len(page["accounts"]),
                 )
         finally:
             await consumer.stop()

@@ -33,6 +33,7 @@ from app.adaptive_delay import AdaptiveDelay
 from app.proxy_pool import ProxyPool
 from app.config import settings
 import socksio.exceptions
+from json import JSONDecodeError
 
 
 log = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ HYPEAUDITOR_SUGGEST_URL = "https://pdata.hypeauditor.com/suggest/"
 
 adaptive_delay = AdaptiveDelay(
     target=settings.enrich_target_interval,
-    initial_sleep=settings.enrich_max_sleep
+    initial_sleep=0
 )
 
 
@@ -51,7 +52,7 @@ async def lookup_follower_count(
     proxy_pool: ProxyPool,
     username: str,
     max_attempts: int = 3,
-) -> dict | None:
+) -> tuple[dict | None, bool]:
     """Returns {follower_count, is_verified, is_private, hypeauditor_user_id} or None if not found.
 
     http_client is used unproxied for two things: refreshing the proxy list
@@ -61,7 +62,10 @@ async def lookup_follower_count(
     """
     params = {"search": username, "st": "ig", "excl_st": "sn"}
 
+    exhausted_retries = False
+
     for attempt in range(max_attempts):
+        resp = None
         proxy = await proxy_pool.get_proxy(http_client)
         # await asyncio.sleep(random.uniform(10, 10))
         await adaptive_delay.wait()
@@ -81,14 +85,19 @@ async def lookup_follower_count(
             adaptive_delay.record(total_time)
 
         except httpx.HTTPError as e:
-            if proxy is not None:
+            response = getattr(e, "response", None)
+            proxy_pool.release_proxy(proxy)
+
+            if response is not None and response.status_code == 403:
+                log.warning("403 forbidden for %s via %s, benching proxy", username, proxy.url if proxy else "direct")
+
+            elif proxy is not None:
                 should_release = proxy.record_failure()
 
-                if should_release:
-                    proxy_pool.release_proxy(proxy)    
+                # proxy_pool.release_proxy(proxy)    
                     
-            log.warning("attempt %d/%d failed for %s via %s: %s",
-                        attempt + 1, max_attempts, username, proxy.url if proxy else "direct", e)
+                log.warning("attempt %d/%d failed for %s via %s: %s",
+                            attempt + 1, max_attempts, username, proxy.url if proxy else "direct", e)
             continue
 
         except (socksio.exceptions.ProtocolError) as e:
@@ -97,13 +106,32 @@ async def lookup_follower_count(
                 proxy.url,
             )
             # proxy.benched_until = time.monotonic() + BENCH_SECONDS
-            proxy.record_failure()
+            # proxy.record_failure()
             proxy_pool.release_proxy(proxy)
+            continue
             
-        if proxy is not None:
-            proxy.record_success()
+ 
+        
+        try:
+            if resp is None:
+                log.warning("resp is None for %s ! releasing proxy", username)
+                proxy_pool.release_proxy(proxy)
+                continue
+                
+            elif resp.status_code == 200 and proxy is not None:
+                proxy.record_success()
 
-        data = resp.json()
+            data = resp.json()
+            
+        except JSONDecodeError:
+            log.warning(
+                "Invalid JSON response. status=%s body=%s",
+                resp.status_code,
+                resp.text[:500]
+            )
+            proxy_pool.release_proxy(proxy)
+            continue
+        
         for item in data.get("list", []):
             if item.get("username", "").lower() == username.lower():
                 return {
@@ -112,8 +140,10 @@ async def lookup_follower_count(
                     "is_private": item.get("is_private"),
                     "insta_id": int(item.get("user_id")),
                     "name": item.get("full_name"),     
-                }
-        return None  # request succeeded, username just wasn't in the results
+                } , exhausted_retries
+            
+        return None , exhausted_retries  # request succeeded, username just wasn't in the results
 
     log.warning("all %d attempts exhausted for %s", max_attempts, username)
-    return None
+    exhausted_retries = True
+    return None , exhausted_retries

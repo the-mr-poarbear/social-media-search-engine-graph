@@ -60,6 +60,7 @@ class User(Base):
     # 'queued'                 — sitting in crawl_queue
     # 'completed'               — following-list crawl finished
     # 'skipped_below_threshold' — known follower_count, doesn't clear the bar
+    # 'not_present_in_enrichment_list'
     # 'enrichment_failed'      — follower_count UNKNOWN (HypeAuditor lookup
     #                            failed, not that we checked and it's low).
     #                            Can't be queued for the same reason
