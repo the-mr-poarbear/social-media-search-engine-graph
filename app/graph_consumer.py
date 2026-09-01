@@ -33,8 +33,9 @@ import asyncio
 import logging
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db import CrawlQueue, Edge, SessionLocal, User
@@ -51,72 +52,130 @@ async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, se
     source_user_id = page["source_user_id"]
     for acc in page["accounts"]:
         username = acc["username"]
+        insta_id = acc.get("insta_id")
         is_private = acc["is_private"]
         profile_pic = acc["profile_pic"]
 
-        # Look up first; if new, always insert a row into `users` regardless
-        # of follower count — we want the full set of discovered accounts on
-        # record (e.g. in case one crosses the threshold later on a re-check).
-        # Only the EDGE is gated on the threshold, since edges is what would
-        # actually balloon toward 1B+ rows if we recorded every following
-        # relationship instead of just the ones to accounts worth crawling.
-        user = (await session.execute(select(User).where(User.username == username))).scalar_one_or_none()
+        # Look up by insta_id first if available, or by username
+        if insta_id:
+            user = (await session.execute(
+                select(User).where(or_(User.insta_id == insta_id, User.username == username))
+            )).scalar_one_or_none()
+        else:
+            user = (await session.execute(
+                select(User).where(User.username == username)
+            )).scalar_one_or_none()
+
         enrichment = None
+        exhausted_retries = False
         crawl_state = user.crawl_state if user else None
 
         if user is None or crawl_state is None or crawl_state == "enrichment_failed":
             try:
                 if not is_private:
-                    enrichment , exhausted_retries = await lookup_follower_count(http_client, proxy_pool , username)
-                    crawl_state = "never_crawled"
-            except httpx.HTTPError as e:
-                log.warning("hypeauditor lookup failed for %s: %s", username, e)
+                    enrichment, exhausted_retries = await lookup_follower_count(http_client, proxy_pool, username)
+                    if enrichment:
+                        follower_count = enrichment.get("follower_count") or 0
+                        if follower_count < settings.follower_threshold:
+                            crawl_state = "skipped_below_threshold"
+                        else:
+                            crawl_state = "never_crawled"
+            except Exception as e:
+                log.warning("Enrichment lookup failed for %s: %s", username, e)
                 enrichment = None
                 crawl_state = "enrichment_failed"
-                
+
             if enrichment is None and not is_private:
                 if exhausted_retries:
                     crawl_state = "enrichment_failed"
-                    log.warning("request exhausted for %s", username)
+                    log.warning("Request exhausted for %s", username)
                 else:
                     crawl_state = "not_present_in_enrichment_list"
-                    log.warning("No HypeAuditor match for %s", username)
-                # continue
+                    log.warning("No enrichment match for %s", username)
             elif enrichment is None and is_private:
                 log.info("Private account %s, skipping enrichment", username)
                 crawl_state = "never_crawled"
                 enrichment = None
 
-            stmt = (
-                pg_insert(User)
-                .values(
-                    insta_id=acc["insta_id"],
-                    username=username,
-                    follower_count=enrichment["follower_count"] if enrichment else None,
-                    is_verified=acc["is_verified"] ,
-                    name=acc["name"] ,
-                    is_private=is_private,
-                    discovered_by=source_user_id,
-                    crawl_state=crawl_state,
-                    profile_pic=profile_pic
-                )
-                .on_conflict_do_nothing(index_elements=["username"])
-                .returning(User)
-            )
-            result = await session.execute(stmt)
-            await session.commit()
-            user = result.scalar_one_or_none()
             if user is None:
-                # lost a race to another consumer instance inserting the same user
-                user = (await session.execute(select(User).where(User.username == username))).scalar_one()
+                # Target insta_id constraint if present, fallback to username
+                effective_insta_id = insta_id or (enrichment.get("insta_id") if enrichment else None)
+                effective_name = acc.get("name") or (enrichment.get("name") if enrichment else None)
+                effective_is_verified = acc.get("is_verified", False) or (enrichment.get("is_verified") if enrichment else False)
+                effective_profile_pic = profile_pic or (enrichment.get("profile_pic") if enrichment else None)
+                effective_following_count = enrichment.get("following_count") if enrichment else None
+                effective_country = enrichment.get("country") if enrichment else None
+                effective_category = enrichment.get("category") if enrichment else None
+
+                index_elem = ["insta_id"] if effective_insta_id else ["username"]
+                stmt = (
+                    pg_insert(User)
+                    .values(
+                        insta_id=effective_insta_id,
+                        username=username,
+                        follower_count=enrichment["follower_count"] if enrichment else None,
+                        following_count=effective_following_count,
+                        is_verified=effective_is_verified,
+                        name=effective_name,
+                        is_private=is_private,
+                        country=effective_country,
+                        category=effective_category,
+                        discovered_by=source_user_id,
+                        crawl_state=crawl_state,
+                        profile_pic=effective_profile_pic,
+                    )
+                    .on_conflict_do_nothing(index_elements=index_elem)
+                    .returning(User)
+                )
+                try:
+                    result = await session.execute(stmt)
+                    await session.commit()
+                    user = result.scalar_one_or_none()
+                except IntegrityError:
+                    await session.rollback()
+                    user = None
+
+                if user is None:
+                    # Race condition with parallel worker or alternate unique constraint
+                    if effective_insta_id:
+                        user = (await session.execute(
+                            select(User).where(or_(User.insta_id == effective_insta_id, User.username == username))
+                        )).scalar_one_or_none()
+                    else:
+                        user = (await session.execute(
+                            select(User).where(User.username == username)
+                        )).scalar_one_or_none()
+            else:
+                # Existing user row updating state
+                if enrichment:
+                    if user.follower_count is None and enrichment.get("follower_count") is not None:
+                        user.follower_count = enrichment["follower_count"]
+                    if user.following_count is None and enrichment.get("following_count") is not None:
+                        user.following_count = enrichment["following_count"]
+                    if user.country is None and enrichment.get("country") is not None:
+                        user.country = enrichment["country"]
+                    if user.category is None and enrichment.get("category") is not None:
+                        user.category = enrichment["category"]
+                    if user.profile_pic is None and enrichment.get("profile_pic") is not None:
+                        user.profile_pic = enrichment["profile_pic"]
+                    if user.name is None and enrichment.get("name") is not None:
+                        user.name = enrichment["name"]
+                    if user.is_verified is None and enrichment.get("is_verified") is not None:
+                        user.is_verified = enrichment["is_verified"]
+                if user.username != username:
+                    user.username = username
+                if user.insta_id is None and insta_id:
+                    user.insta_id = insta_id
+                user.crawl_state = crawl_state
+                await session.merge(user)
+                await session.commit()
+
+        if user is None:
+            log.warning("Could not resolve or insert user %s (insta_id: %s), skipping", username, insta_id)
+            continue
 
         
 
-        if (user.follower_count or 0) < settings.follower_threshold:
-            user.discovery_score = (user.discovery_score or 0) + 1
-            await session.merge(user)
-            await session.commit()
-            continue  # row stays in `users`, but no edge, no queueing, only discovery_score
 
         # Threshold cleared. Insert the edge and check whether it was
         # actually new. Kafka gives at-least-once delivery — if this
@@ -137,10 +196,20 @@ async def process_page(http_client: httpx.AsyncClient, proxy_pool: ProxyPool, se
         if not edge_is_new:
             continue  # already recorded this exact relationship, nothing left to do
 
+        log.info("user already existed %s, adding discovery score", user.username)
+
         user.discovery_score = (user.discovery_score or 0) + 1
         await session.merge(user)
         await session.commit()
 
+
+        if (user.follower_count or 0) < settings.follower_threshold:
+            if user.crawl_state == "never_crawled":
+                user.crawl_state = "skipped_below_threshold"
+                await session.merge(user)
+                await session.commit()
+            continue  # row stays in `users`, but no queueing, only discovery_score
+        
         if user.crawl_state is not None and user.crawl_state != "never_crawled":
             continue  # already crawled or in flight, don't re-enqueue
 

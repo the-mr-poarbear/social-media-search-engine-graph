@@ -56,14 +56,18 @@ class FollowedAccount:
 
 
 class InstagramSession:
-    def __init__(self):
+    def __init__(self, proxy: str | None = None):
         if not (settings.ig_sessionid and settings.doc_id and settings.fb_dtsg):
             raise RuntimeError(
                 "Missing IG_SESSIONID / DOC_ID / FB_DTSG env vars. "
                 "Pull these from your browser's cookie jar for instagram.com "
                 "while logged in, then export them before running a worker."
             )
+        
+        self.proxy = proxy if proxy is not None else (settings.worker_proxy or None)
+
         self._client = httpx.AsyncClient(
+            proxy=self.proxy,
             headers={
                 "User-Agent": USER_AGENT,
                 # "X-IG-App-ID": settings.ig_app_id,

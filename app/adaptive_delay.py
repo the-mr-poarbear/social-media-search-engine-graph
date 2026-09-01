@@ -1,17 +1,31 @@
 
 import asyncio
 import logging
+import time
+
 log = logging.getLogger(__name__)
 
 
 class AdaptiveDelay:
-    def __init__(self, target: float, initial_sleep: float):
+    def __init__(self, target: float, initial_sleep: float = 0.0, min_sleep: float = 0.0, max_sleep: float = 10.0):
         self.target = target
-        self.sleep_time = initial_sleep
+        self.min_sleep = min_sleep
+        self.max_sleep = max_sleep
+        self.sleep_time = max(min_sleep, min(max_sleep, initial_sleep))
         self.samples = []
+        self.next_available_at = 0.0
 
-    async def wait(self):
-        await asyncio.sleep(self.sleep_time)
+    def time_until_ready(self) -> float:
+        return max(0.0, self.next_available_at - time.monotonic())
+
+    async def wait(self) -> float:
+        remaining = self.time_until_ready()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        return remaining
+
+    def schedule_next(self):
+        self.next_available_at = time.monotonic() + self.sleep_time
 
     def record(self, total_time: float):
         self.samples.append(total_time)
@@ -24,8 +38,8 @@ class AdaptiveDelay:
             self.sleep_time += difference
 
             self.sleep_time = max(
-                0,
-                min(60, self.sleep_time)
+                self.min_sleep,
+                min(self.max_sleep, self.sleep_time)
             )
 
             log.info(
@@ -36,3 +50,5 @@ class AdaptiveDelay:
             )
 
             self.samples.clear()
+
+        self.next_available_at = time.monotonic() + self.sleep_time

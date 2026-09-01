@@ -35,5 +35,6 @@ def make_consumer(topic: str, group_id: str) -> AIOKafkaConsumer:
         value_deserializer=_deserialize,
         enable_auto_commit=False,  # commit only after DB write succeeds
         auto_offset_reset="earliest",
-        max_poll_interval_ms=650000,
+        max_poll_interval_ms=1300000,
+        session_timeout_ms=60000
     )

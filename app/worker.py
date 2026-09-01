@@ -38,7 +38,11 @@ WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 
 
 async def _mark_failed(session, queue_id: int, error: str, requeue_delay_s: int = 60):
-    row = (await session.execute(select(CrawlQueue).where(CrawlQueue.id == queue_id))).scalar_one()
+    row = (await session.execute(select(CrawlQueue).where(CrawlQueue.id == queue_id))).scalar_one_or_none()
+    if not row:
+        return
+    if row.status not in ("processing", "pending"):
+        return
     row.attempts += 1
     row.last_error = error[:2000]
     if row.attempts >= settings.max_attempts:
@@ -80,72 +84,43 @@ async def handle_job(ig: InstagramSession, producer, job: dict):
     start = time.monotonic()
     async with SessionLocal() as session:
         try:
-            # if not insta_id:
-            #     profile = await ig.resolve_user(insta_id)
-            #     insta_id = profile["insta_id"]
-            #     await session.execute(
-            #         update(User)
-            #         .where(User.id == user_id)
-            #         .values(
-            #             insta_id=insta_id,
-            #             follower_count=profile["follower_count"],
-            #             following_count=profile["following_count"],
-            #             is_verified=profile["is_verified"],
-            #             name=profile["name"],
-            #             profile_pic=profile["profile_pic"],
-            #         )
-            #     )
-            #     await session.commit()
+            now = datetime.now(timezone.utc)
+            row = (
+                await session.execute(select(CrawlQueue).where(CrawlQueue.id == queue_id))
+            ).scalar_one_or_none()
 
-                # THE actual gate: whatever got this row into crawl_queue — a
-                # HypeAuditor estimate that's since drifted, a seed row that
-                # was never checked at all, a stale queue entry — this is the
-                # live IG number, checked right before we'd otherwise spend a
-                # full pagination run on their following list.
-            #     if (profile["follower_count"] or 0) < settings.follower_threshold:
-            #         log.info(
-            #             "%s: %s followers, below threshold (%s) — skipping crawl",
-            #             username, profile["follower_count"], settings.follower_threshold,
-            #         )
-            #         await session.execute(
-            #             update(CrawlQueue)
-            #             .where(CrawlQueue.id == queue_id)
-            #             .values(status="completed", locked_by=None, locked_until=None)
-            #         )
-            #         await session.execute(
-            #             update(User).where(User.id == user_id).values(crawl_state="skipped_below_threshold")
-            #         )
-            #         await session.commit()
-            #         return
-            # else:
-            #     # insta_id was already known (e.g. re-queued for refresh) —
-            #     # still worth a fresh check in case follower count dropped.
-            #     existing_user = (
-            #         await session.execute(select(User).where(User.id == user_id))
-            #     ).scalar_one()
-            #     if (existing_user.follower_count or 0) < settings.follower_threshold:
-            #         log.info("%s: below threshold on recheck — skipping crawl", username)
-            #         await session.execute(
-            #             update(CrawlQueue)
-            #             .where(CrawlQueue.id == queue_id)
-            #             .values(status="completed", locked_by=None, locked_until=None)
-            #         )
-            #         await session.execute(
-            #             update(User).where(User.id == user_id).values(crawl_state="skipped_below_threshold")
-            #         )
-            #         await session.commit()
-            #         return
+            if not row:
+                log.warning("%s: queue_id=%d not found in crawl_queue, skipping", username, queue_id)
+                return
+
+            if row.status == "completed":
+                log.info("%s: queue_id=%d already completed, skipping duplicate message", username, queue_id)
+                return
+
+            if row.status != "processing" or (row.locked_until and row.locked_until < now):
+                log.warning(
+                    "%s: queue_id=%d lease expired or status changed (status=%s, locked_until=%s), skipping stale job",
+                    username,
+                    queue_id,
+                    row.status,
+                    row.locked_until,
+                )
+                return
+
+            # Claim active worker ownership & renew initial lease
+            row.locked_by = WORKER_ID
+            row.locked_until = now + timedelta(seconds=settings.lease_seconds)
+            await session.commit()
 
             page_num = 0
             page_size = 200
             chunk_size = settings.worker_message_size
-            
+
             while True:
-                accounts, hasmore = await ig.get_following_page(insta_id, page=page_num , count=page_size )
+                accounts, hasmore = await ig.get_following_page(insta_id, page=page_num, count=page_size)
 
-
-                for chunk_index, start in enumerate(range(0, len(accounts), chunk_size)):
-                    chunk = accounts[start:start + chunk_size]
+                for chunk_index, start_idx in enumerate(range(0, len(accounts), chunk_size)):
+                    chunk = accounts[start_idx : start_idx + chunk_size]
 
                     await producer.send_and_wait(
                         settings.topic_following_pages,
@@ -175,7 +150,7 @@ async def handle_job(ig: InstagramSession, producer, job: dict):
                         page_num,
                         chunk_index,
                         len(chunk),
-                        not hasmore
+                        not hasmore,
                     )
 
                 page_num += 1
@@ -183,25 +158,43 @@ async def handle_job(ig: InstagramSession, producer, job: dict):
                 if not hasmore:
                     break
 
+                # Heartbeat: extend lease after each page so long pagination runs don't expire mid-crawl
+                # await session.execute(
+                #     update(CrawlQueue)
+                #     .where(CrawlQueue.id == queue_id, CrawlQueue.locked_by == WORKER_ID)
+                #     .values(locked_until=datetime.now(timezone.utc) + timedelta(seconds=settings.lease_seconds))
+                # )
+                # await session.commit()
+
             await _mark_completed(session, queue_id, user_id, time.monotonic() - start)
 
         except RateLimited as e:
             log.warning("rate limited on %s: %s", username, e)
+            await session.rollback()
             await _mark_failed(session, queue_id, str(e), requeue_delay_s=300)
         except AuthExpired as e:
             log.error("auth expired: %s — refresh IG_SESSIONID and restart the worker", e)
+            await session.rollback()
             await _mark_failed(session, queue_id, str(e), requeue_delay_s=600)
             raise  # no point continuing this worker with a dead session
         except ScrapeError as e:
             log.warning("scrape error on %s: %s", username, e)
+            await session.rollback()
             await _mark_failed(session, queue_id, str(e))
         except Exception as e:  # noqa: BLE001 — POC-grade catch-all so one bad job doesn't kill the worker
             log.exception("unexpected error on %s", username)
+            await session.rollback()
             await _mark_failed(session, queue_id, repr(e))
 
 
-async def run():
-    ig = InstagramSession()
+async def run(proxy: str | None = None):
+    effective_proxy = proxy or settings.worker_proxy or None
+    if effective_proxy:
+        log.info("Starting worker with proxy: %s", effective_proxy)
+    else:
+        log.info("Starting worker without proxy (direct connection)")
+
+    ig = InstagramSession(proxy=effective_proxy)
     consumer = make_consumer(settings.topic_crawl_jobs, group_id="workers")
     await consumer.start()
     try:
@@ -216,4 +209,14 @@ async def run():
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Instagram Crawl Worker")
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        help="Proxy URL (e.g. socks5://127.0.0.1:2080 or http://127.0.0.1:8080). Overrides WORKER_PROXY environment variable.",
+    )
+    args = parser.parse_args()
+    asyncio.run(run(proxy=args.proxy))

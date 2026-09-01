@@ -114,6 +114,8 @@ async def run():
                     )
                 log.info("dispatched %d jobs (%d discovery, %d seed)", len(batch), len(discovery_rows), len(seed_rows))
 
+            await asyncio.sleep(settings.scheduler_poll_interval)
+
 
 if __name__ == "__main__":
     asyncio.run(run())

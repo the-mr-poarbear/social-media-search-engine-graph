@@ -70,10 +70,10 @@ services:
       - "7687:7687"   # Bolt (this is what your Python driver connects to)
     environment:
       - NEO4J_AUTH=neo4j/your_password_here
-      - NEO4J_PLUGINS='["apoc", "graph-data-science"]''
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
       - NEO4J_dbms_security_procedures_unrestricted="apoc.*,gds.*"
       - NEO4J_server_memory_heap_initial__size=1G
-      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_memory_heap_max__size=4G
       - NEO4J_server_memory_pagecache_size=1G
 
     volumes:

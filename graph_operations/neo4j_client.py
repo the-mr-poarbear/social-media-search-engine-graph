@@ -33,6 +33,13 @@ SET u.insta_id = row.insta_id,
     u.discovery_score = row.discovery_score
 """
 
+POSITION_UPDATE_QUERY = """
+UNWIND $rows AS row
+MATCH (u:User)
+WHERE u.id = row.id OR u.id = toString(row.id) OR (row.id IS NOT NULL AND u.id = toInteger(row.id))
+SET u.x = row.x, u.y = row.y
+"""
+
 
 class Neo4jLoader:
     def __init__(self, uri: str, user: str, password: str):
@@ -65,3 +72,7 @@ class Neo4jLoader:
     async def upsert_users_batch(self, rows: list[dict]):
         async with self.driver.session() as session:
             await session.run(USER_UPSERT_QUERY, rows=rows)
+
+    async def upsert_positions_batch(self, rows: list[dict]):
+        async with self.driver.session() as session:
+            await session.run(POSITION_UPDATE_QUERY, rows=rows)
