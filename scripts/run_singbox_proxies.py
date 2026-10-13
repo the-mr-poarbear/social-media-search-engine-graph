@@ -112,10 +112,25 @@ def main():
         log.error("No proxies available in batch. Exiting.")
         shutdown()
 
-    # Update shared state JSON with initial health testing
-    state_manager = ProxyStateManager()
-    health_results = state_manager.init_file(local_urls, names=names_map, test_proxies=True) or {}
-    log.info("Successfully updated shared proxy state at %s", settings.proxy_state_file)
+    # Update shared state JSONs with initial health testing
+    # Maintain both isolated state files (worker & enrichment) and legacy fallback
+    managed_files = list(dict.fromkeys([
+        settings.worker_proxy_state_file,
+        settings.enrichment_proxy_state_file,
+        settings.proxy_state_file,
+    ]))
+    state_managers = [ProxyStateManager(f) for f in managed_files]
+
+    # Run initial health test once on the first state manager
+    primary_sm = state_managers[0]
+    health_results = primary_sm.init_file(local_urls, names=names_map, test_proxies=True) or {}
+    
+    # Initialize remaining state files without re-running network health tests
+    for sm in state_managers[1:]:
+        sm.init_file(local_urls, names=names_map, test_proxies=False)
+
+    for f in managed_files:
+        log.info("Successfully updated shared proxy state at %s", f)
 
     # Build metadata list for all configs to export initial status CSV
     nodes_meta = []
@@ -133,11 +148,11 @@ def main():
             "init_reason": hr[2],
         })
 
-    # Export initial CSV report
-    current_proxies = state_manager._read_data_unlocked().get("proxies", {})
+    # Export initial CSV report using primary manager
+    current_proxies = primary_sm._read_data_unlocked().get("proxies", {})
     export_configs_status_csv(csv_report_file, nodes_meta, current_proxies)
     log.info("Exported V2Ray configs status report -> %s", csv_report_file)
-    log.info("Proxy manager is running! Workers can now consume proxies from %s.", settings.proxy_state_file)
+    log.info("Proxy manager running! Isolated pools active at: %s and %s", settings.worker_proxy_state_file, settings.enrichment_proxy_state_file)
 
     shortage_cooldown = 15.0  # min seconds between shortage checks
     idle_interval = 300.0     # 5 minutes slow routine check when healthy
@@ -156,39 +171,41 @@ def main():
             now = time.time()
             elapsed = now - last_recovery_check
 
-            status = state_manager.get_pool_status()
-            has_ready_proxies = status["benched_ready_to_test"] > 0
-            has_shortage = status["available_free"] == 0
+            # Check statuses across all managed managers
+            any_ready = False
+            any_shortage = False
+            for sm in state_managers:
+                status = sm.get_pool_status()
+                if status["benched_ready_to_test"] > 0:
+                    any_ready = True
+                if status["available_free"] == 0:
+                    any_shortage = True
 
-            if has_ready_proxies:
+            if any_ready:
                 should_check = False
-                if has_shortage and elapsed >= shortage_cooldown:
+                if any_shortage and elapsed >= shortage_cooldown:
                     log.warning(
-                        "Proxy shortage (0 free, %d in use, %d ready to test). Running recovery check...",
-                        status["in_use"],
-                        status["benched_ready_to_test"],
+                        "Proxy shortage detected in pool. Running recovery check across managed pools...",
                     )
                     should_check = True
                 elif elapsed >= idle_interval:
                     log.info(
-                        "Routine recovery check (%d free, %d in use, %d ready to test)...",
-                        status["available_free"],
-                        status["in_use"],
-                        status["benched_ready_to_test"],
+                        "Routine recovery check across managed pools...",
                     )
                     should_check = True
 
                 if should_check:
                     last_recovery_check = now
-                    state_manager.check_and_recover_benched_proxies()
-                    current_proxies = state_manager._read_data_unlocked().get("proxies", {})
+                    for sm in state_managers:
+                        sm.check_and_recover_benched_proxies()
+                    current_proxies = primary_sm._read_data_unlocked().get("proxies", {})
                     export_configs_status_csv(csv_report_file, nodes_meta, current_proxies)
                     last_csv_sync = now
 
             # Periodically sync CSV report with worker activity metrics every 30s
             if now - last_csv_sync >= 30.0:
                 last_csv_sync = now
-                current_proxies = state_manager._read_data_unlocked().get("proxies", {})
+                current_proxies = primary_sm._read_data_unlocked().get("proxies", {})
                 export_configs_status_csv(csv_report_file, nodes_meta, current_proxies)
     except KeyboardInterrupt:
         shutdown()

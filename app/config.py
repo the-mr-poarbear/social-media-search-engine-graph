@@ -27,16 +27,18 @@ class Settings:
     fb_dtsg: str = os.getenv("FB_DTSG", "")
     ig_app_id: str = os.getenv("IG_APP_ID", "936619743392459")  # public web app id
     doc_id: str = os.getenv("DOC_ID", "37095153540132433")  # public web doc id
+    following_query_hash: str = os.getenv("QUERY_HASH", "58712303d941c6855d4e888c5f0cd22f")
     
     # Crawl behaviour
     follower_threshold: int = int(os.getenv("FOLLOWER_THRESHOLD", "100000"))
     discovery_queue_share: float = float(os.getenv("DISCOVERY_QUEUE_SHARE", "0.8"))
     scheduler_batch_size: int = int(os.getenv("SCHEDULER_BATCH_SIZE", "10"))
-    scheduler_poll_interval: float = float(os.getenv("SCHEDULER_POLL_INTERVAL", "900.0"))
+    scheduler_poll_interval: float = float(os.getenv("SCHEDULER_POLL_INTERVAL", "300.0"))
     lease_seconds: int = int(os.getenv("LEASE_SECONDS", "18000"))
-    request_min_delay: float = float(os.getenv("REQUEST_MIN_DELAY", "7.0"))
-    request_max_delay: float = float(os.getenv("REQUEST_MAX_DELAY", "11.0"))
+    request_min_delay: float = float(os.getenv("REQUEST_MIN_DELAY", "4.0"))
+    request_max_delay: float = float(os.getenv("REQUEST_MAX_DELAY", "7.0"))
     max_attempts: int = int(os.getenv("MAX_ATTEMPTS", "3"))
+    failed_requeue_interval: float = float(os.getenv("FAILED_REQUEUE_INTERVAL", "3600.0"))
 
     # Enrichment behaviour
     enrichment_provider: str = os.getenv("ENRICHMENT_PROVIDER", "mixed")  # "mixed", "trendhero", "hypeauditor"
@@ -60,6 +62,8 @@ class Settings:
         ).split(",") if p.strip()
     )
     proxy_state_file: str = os.getenv("PROXY_STATE_FILE", "data/proxies_state.json")
+    worker_proxy_state_file: str = os.getenv("WORKER_PROXY_STATE_FILE", "data/worker/proxies_state.json")
+    enrichment_proxy_state_file: str = os.getenv("ENRICHMENT_PROXY_STATE_FILE", "data/enrichment/proxies_state.json")
     proxy_lease_seconds: float = float(os.getenv("PROXY_LEASE_SECONDS", "30.0"))
     proxy_timeout: float = float(os.getenv("PROXY_TIMEOUT", "12.0"))
     proxy_connect_timeout: float = float(os.getenv("PROXY_CONNECT_TIMEOUT", "9"))
@@ -96,7 +100,7 @@ class Settings:
 
     # Worker behaviour
     worker_message_size: int = int(os.getenv("WORKER_MESSAGE_SIZE", "10"))
-    worker_proxy: str = os.getenv("WORKER_PROXY", "socks5://127.0.0.1:34832")
+    worker_proxy: str = os.getenv("WORKER_PROXY", "socks5://127.0.0.1:10808")
 
 
     neo4j_uri: str = os.getenv("NEO4J_URI", "neo4j://localhost:7687")

@@ -56,21 +56,14 @@ class User(Base):
     seed_association_score: Mapped[float] = mapped_column(Float, default=0.0)
     discovery_score: Mapped[int] = mapped_column(Integer, default=0)
     crawl_state: Mapped[str] = mapped_column(String, default="never_crawled")
-    # 'never_crawled'          — eligible, follower_count known, not yet queued/crawled
+    # 'pending_enrichment'     — newly discovered stub account, awaiting follower count lookup
+    # 'enriching'              — currently claimed and being enriched by an enrichment_worker
+    # 'never_crawled'          — eligible, follower_count known and >= threshold, not yet queued/crawled
     # 'queued'                 — sitting in crawl_queue
     # 'completed'               — following-list crawl finished
     # 'skipped_below_threshold' — known follower_count, doesn't clear the bar
-    # 'not_present_in_enrichment_list'
-    # 'enrichment_failed'      — follower_count UNKNOWN (HypeAuditor lookup
-    #                            failed, not that we checked and it's low).
-    #                            Can't be queued for the same reason
-    #                            skipped_below_threshold can't — no valid
-    #                            basis to justify a crawl. Retried on every
-    #                            later re-discovery (app/graph_consumer.py)
-    #                            and by scripts/retry_failed_enrichment.py
-    #                            for accounts never re-discovered. On a
-    #                            successful retry this resets back to
-    #                            'never_crawled', not some third state.
+    # 'not_present_in_enrichment_list' — user not found in enrichment provider's index
+    # 'enrichment_failed'      — transient proxy/network failure, retried by enrichment_worker
     is_verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     is_private: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     discovered_by: Mapped[int | None] = mapped_column(

@@ -17,12 +17,16 @@ the point right now is to prove the pipeline shape, not to survive at scale.
 """
 
 import asyncio
+import json
+import logging
 import random
 from dataclasses import dataclass
 
 import httpx
 
 from app.config import settings
+
+log = logging.getLogger(__name__)
 
 BASE_URL = "https://i.instagram.com/api/v1"
 WEB_BASE_URL = "https://www.instagram.com/api/v1"
@@ -57,40 +61,39 @@ class FollowedAccount:
 
 class InstagramSession:
     def __init__(self, proxy: str | None = None):
-        if not (settings.ig_sessionid and settings.doc_id and settings.fb_dtsg):
+        if not settings.ig_sessionid:
             raise RuntimeError(
-                "Missing IG_SESSIONID / DOC_ID / FB_DTSG env vars. "
-                "Pull these from your browser's cookie jar for instagram.com "
-                "while logged in, then export them before running a worker."
+                "Missing IG_SESSIONID env var. "
+                "Pull this from your browser's cookie jar for instagram.com "
+                "while logged in, then export it before running a worker."
             )
         
         self.proxy = proxy if proxy is not None else (settings.worker_proxy or None)
+
+        cookies = {"sessionid": settings.ig_sessionid}
+        if settings.ig_ds_user_id:
+            cookies["ds_user_id"] = settings.ig_ds_user_id
 
         self._client = httpx.AsyncClient(
             proxy=self.proxy,
             headers={
                 "User-Agent": USER_AGENT,
-                # "X-IG-App-ID": settings.ig_app_id,
-                # "X-CSRFToken": settings.ig_csrftoken,
-                # "X-Requested-With": "XMLHttpRequest",
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin',
-                'Pragma': 'no-cache',
-                'Cache-Control': 'no-cache',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Origin': 'https://www.instagram.com',
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Connection': 'keep-alive',
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "Pragma": "no-cache",
+                "Cache-Control": "no-cache",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://www.instagram.com",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Connection": "keep-alive",
                 "Referer": "https://www.instagram.com/",
-                'x-ig-app-id': settings.ig_app_id,
+                "X-Requested-With": "XMLHttpRequest",
+                "x-ig-app-id": settings.ig_app_id,
             },
-            cookies={
-                "sessionid": settings.ig_sessionid,
-                # "csrftoken": settings.ig_csrftoken,
-                # "ds_user_id": settings.ig_ds_user_id,
-            },
+            cookies=cookies,
             timeout=15.0,
+            follow_redirects=True,
         )
 
     async def aclose(self):
@@ -102,7 +105,7 @@ class InstagramSession:
         resp = await self._client.post(url, json=payload, params=params)
         if resp.status_code == 429:
             raise RateLimited(f"429 on {url}")
-        if resp.status_code in (401, 403):
+        if resp.status_code in (401, 403) or "/accounts/login" in str(resp.url):
             raise AuthExpired(f"{resp.status_code} on {url} — session cookie likely expired/challenged")
         if resp.status_code != 200:
             raise ScrapeError(f"unexpected status {resp.status_code} on {url}: {resp.text[:200]}")
@@ -114,8 +117,10 @@ class InstagramSession:
         resp = await self._client.get(url, params=params)
         if resp.status_code == 429:
             raise RateLimited(f"429 on {url}")
-        if resp.status_code in (401, 403):
+        if resp.status_code in (401, 403) or "/accounts/login" in str(resp.url):
             raise AuthExpired(f"{resp.status_code} on {url} — session cookie likely expired/challenged")
+        if "checkpoint_required" in resp.text:
+            raise AuthExpired("checkpoint_required detected — account challenged")
         if resp.status_code != 200:
             raise ScrapeError(f"unexpected status {resp.status_code} on {url}: {resp.text[:200]}")
         return resp
@@ -144,10 +149,80 @@ class InstagramSession:
             "is_private": user.get("is_private", False),
         }
 
+    async def get_following_graphql(
+        self,
+        insta_id: str | int,
+        after_cursor: str | None = None,
+        first: int = 50,
+    ) -> tuple[list[FollowedAccount], bool, str | None]:
+        """
+        Fetches one page of following accounts using Instagram's web GraphQL query endpoint.
+        URL: https://www.instagram.com/graphql/query/?query_hash={QUERY_HASH}&variables={...}
+
+        Returns (accounts, has_next_page, end_cursor).
+        """
+        variables = {
+            "id": str(insta_id),
+            "first": first,
+        }
+        if after_cursor:
+            variables["after"] = after_cursor
+
+        params = {
+            "query_hash": settings.following_query_hash,
+            "variables": json.dumps(variables, separators=(",", ":")),
+        }
+
+        url = "https://www.instagram.com/graphql/query/"
+        resp = await self._throttled_get(url, params=params)
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise ScrapeError(f"Invalid JSON response from GraphQL on {url}: {e}")
+
+        if data.get("status") == "fail" or "message" in data:
+            msg = data.get("message", "")
+            if "rate" in msg.lower() or "wait" in msg.lower():
+                raise RateLimited(f"GraphQL rate limited on {insta_id}: {msg}")
+            raise ScrapeError(f"GraphQL error on {insta_id}: {msg}")
+
+        user_data = data.get("data", {}).get("user")
+        if not user_data:
+            log.warning("No user data returned for insta_id=%s (status=%s)", insta_id, data.get("status"))
+            return [], False, None
+
+        edge_follow = user_data.get("edge_follow") or {}
+        page_info = edge_follow.get("page_info") or {}
+        has_next_page = bool(page_info.get("has_next_page", False))
+        end_cursor = page_info.get("end_cursor")
+
+        edges = edge_follow.get("edges") or []
+        accounts: list[FollowedAccount] = []
+        for edge in edges:
+            node = edge.get("node") or {}
+            node_id = node.get("id")
+            username = node.get("username")
+            if not node_id or not username:
+                continue
+
+            accounts.append(
+                FollowedAccount(
+                    insta_id=int(node_id),
+                    username=username,
+                    name=node.get("full_name"),
+                    is_verified=bool(node.get("is_verified", False)),
+                    profile_pic=node.get("profile_pic_url"),
+                    is_private=bool(node.get("is_private", False)),
+                )
+            )
+
+        return accounts, has_next_page, end_cursor
+
     async def get_following_page(
         self, insta_id: int, page: int | None = None , count: int = 200
     ) -> tuple[list[FollowedAccount], str | None]:
-        """One page (~200 accounts) of who `insta_id` follows.
+        """[Deprecated] One page of who `insta_id` follows via mobile v1 friendships.
 
         Returns (accounts, next_max_id). next_max_id is None when done.
         """

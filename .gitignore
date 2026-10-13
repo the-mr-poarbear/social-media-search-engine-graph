@@ -8,3 +8,5 @@ venv
 *.lock
 data
 bin
+test.py
+response.json

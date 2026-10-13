@@ -40,8 +40,33 @@ def main():
     parser.add_argument(
         "-n", "--consumers", 
         type=int, 
-        default=8, 
-        help="Number of graph_consumer workers to spawn (default: 8)"
+        default=4, 
+        help="Number of graph_consumer workers to spawn (default: 4)"
+    )
+    parser.add_argument(
+        "-e", "--enrichers",
+        type=int,
+        default=1,
+        help="Number of enrichment_worker workers to spawn (default: 1)"
+    )
+    parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=1,
+        help="Number of crawl workers to spawn (default: 1)"
+    )
+    parser.add_argument(
+        "--scheduler",
+        dest="scheduler",
+        action="store_true",
+        default=True,
+        help="Spawn scheduler service tab (default: True)"
+    )
+    parser.add_argument(
+        "--no-scheduler",
+        dest="scheduler",
+        action="store_false",
+        help="Do not spawn scheduler tab"
     )
     parser.add_argument(
         "--wait", 
@@ -78,10 +103,10 @@ def main():
     time.sleep(args.wait)
     
     print("\n" + "=" * 65)
-    print(f"⚡ Step 2: Adding {args.consumers} Consumer Worker Tabs to the same window...")
+    print(f"⚡ Step 2: Adding {args.consumers} Graph Consumer Tabs...")
     print("=" * 65)
     
-    # 2. Add N Graph Consumer tabs to the same window
+    # 2. Add N Graph Consumer tabs
     for i in range(1, args.consumers + 1):
         print(f" -> Opening Tab: Graph Consumer #{i}...")
         launch_tab(
@@ -94,7 +119,64 @@ def main():
         time.sleep(0.35)  # slight delay to let Windows Terminal register the tab
 
     print("\n" + "=" * 65)
-    print(f"✅ All {args.consumers} workers + Singbox are open as tabs in one window!")
+    print(f"✨ Step 3: Adding {args.enrichers} Enrichment Worker Tabs...")
+    print("=" * 65)
+
+    # 3. Add N Enrichment Worker tabs
+    for i in range(1, args.enrichers + 1):
+        print(f" -> Opening Tab: Enrichment Worker #{i}...")
+        launch_tab(
+            title=f"Enricher #{i}",
+            command="py -m app.enrichment_worker",
+            cwd=args.cwd,
+            is_first=False,
+            use_wt=has_wt
+        )
+        time.sleep(0.35)
+
+    # 4. Add N Crawl Worker tabs
+    if args.workers > 0:
+        print("\n" + "=" * 65)
+        print(f"🕷️ Step 4: Adding {args.workers} Crawl Worker Tab(s)...")
+        print("=" * 65)
+        for i in range(1, args.workers + 1):
+            print(f" -> Opening Tab: Crawl Worker #{i}...")
+            launch_tab(
+                title=f"Worker #{i}",
+                command="py -m app.worker",
+                cwd=args.cwd,
+                is_first=False,
+                use_wt=has_wt
+            )
+            time.sleep(0.35)
+
+    # 5. Add Scheduler tab
+    if args.scheduler:
+        print("\n" + "=" * 65)
+        print("⏱️ Step 5: Adding Scheduler Tab...")
+        print("=" * 65)
+        print(" -> Opening Tab: Scheduler...")
+        launch_tab(
+            title="Scheduler",
+            command="py -m app.scheduler",
+            cwd=args.cwd,
+            is_first=False,
+            use_wt=has_wt
+        )
+        time.sleep(0.35)
+
+    status_parts = [
+        "Singbox",
+        f"{args.consumers} Consumers",
+        f"{args.enrichers} Enrichers",
+    ]
+    if args.workers > 0:
+        status_parts.append(f"{args.workers} Crawlers")
+    if args.scheduler:
+        status_parts.append("Scheduler")
+
+    print("\n" + "=" * 65)
+    print(f"✅ {' + '.join(status_parts)} active in one window!")
     print("=" * 65)
 
 if __name__ == "__main__":

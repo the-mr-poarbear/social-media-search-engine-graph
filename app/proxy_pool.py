@@ -398,8 +398,9 @@ class ProxyStateManager:
     Coordinates worker claiming, heartbeat leasing, crash recovery, and performance syncing.
     """
 
-    def __init__(self, state_file: str | None = None):
+    def __init__(self, state_file: str | Path | None = None):
         self.state_file_path = Path(state_file or settings.proxy_state_file).resolve()
+        self.state_file_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.state_file_path.with_suffix(".json.lock")
 
     def _read_data_unlocked(self) -> dict:
@@ -798,9 +799,9 @@ class ProxyStateManager:
 
 
 class ProxyPool:
-    def __init__(self):
+    def __init__(self, state_file: str | Path | None = None):
         self._worker_id = f"worker_{os.getpid()}_{uuid.uuid4().hex[:6]}"
-        self._state_manager = ProxyStateManager()
+        self._state_manager = ProxyStateManager(state_file=state_file)
         self._proxies: list[_Proxy] = []
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._current_proxy: _Proxy | None = None

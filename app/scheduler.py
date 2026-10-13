@@ -11,10 +11,11 @@ Run: python -m app.scheduler
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.config import settings
 from app.db import CrawlQueue, SessionLocal, User
@@ -69,10 +70,56 @@ async def _requeue_expired_leases(session):
         log.info("requeued %d jobs with expired leases", result.rowcount)
 
 
+async def _requeue_failed_jobs(session):
+    """Rows marked 'failed' (exceeded max_attempts) go back to pending periodically.
+
+    Selects at most one failed row per user (the latest) and only for users who do
+    not already have an active (pending/processing) queue row, ensuring no conflict
+    with the partial unique index ux_crawl_queue_active_user.
+    """
+    now = datetime.now(timezone.utc)
+    active_users = select(CrawlQueue.user_id).where(
+        CrawlQueue.status.in_(["pending", "processing"]),
+        CrawlQueue.user_id.is_not(None),
+    )
+    latest_failed_ids = (
+        select(func.max(CrawlQueue.id))
+        .where(
+            CrawlQueue.status == "failed",
+            CrawlQueue.user_id.not_in(active_users),
+        )
+        .group_by(CrawlQueue.user_id)
+    )
+
+    result = await session.execute(
+        update(CrawlQueue)
+        .where(CrawlQueue.id.in_(latest_failed_ids))
+        .values(
+            status="pending",
+            attempts=0,
+            available_at=now,
+            locked_by=None,
+            locked_until=None,
+        )
+    )
+    await session.commit()
+    if result.rowcount:
+        log.info("requeued %d failed jobs back to pending", result.rowcount)
+
+
 async def run():
+    last_failed_requeue_at: float | None = None
+
     async with get_producer() as producer:
         while True:
             async with SessionLocal() as session:
+                now_mono = time.monotonic()
+                if last_failed_requeue_at is None or (
+                    now_mono - last_failed_requeue_at >= settings.failed_requeue_interval
+                ):
+                    await _requeue_failed_jobs(session)
+                    last_failed_requeue_at = now_mono
+
                 await _requeue_expired_leases(session)
 
                 discovery_n = round(settings.scheduler_batch_size * settings.discovery_queue_share)

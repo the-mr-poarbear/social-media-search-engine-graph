@@ -1,21 +1,18 @@
 """
-Crawl worker.
+Instagram Crawl Worker (GraphQL Edition).
 
-Consumes `crawl-jobs`, resolves the target's numeric insta_id if we don't
-have it yet, paginates their following list, and publishes each page
-verbatim to `following-pages` for the graph consumer to process. Updates
-the user row + crawl_queue row itself (workers own the "did the crawl
-succeed" bookkeeping; the graph consumer only ever inserts/updates based
-on discovered accounts).
+Consumes `crawl-jobs` from Kafka, resolves the target's following graph using
+Instagram's web GraphQL endpoint (edge_follow), chunks the discovered accounts,
+and publishes them to `following-pages` for graph_consumer ingestion.
 
-Run multiple of these in parallel for real throughput:
+Features:
+- GraphQL Pagination: Uses query_hash with `after` pagination cursors.
+- Isolated Proxy Pool: Claims, monitors, and benches proxies from `data/worker/proxies_state.json`.
+- Lease Heartbeating: Extends DB and proxy leases throughout long pagination crawls.
+- Resilient Error Handling: Automatically benches proxies on HTTP 429 rate-limits.
+
+Run:
   python -m app.worker
-  python -m app.worker   # (another terminal/process — same consumer group)
-
-NOTE: since this is a single-session POC (no proxy/account rotation),
-running many workers in parallel against the *same* IG session just gets
-you rate-limited faster, not more throughput. Keep it to 1 worker unless
-you've wired up multiple sessions.
 """
 
 import asyncio
@@ -29,6 +26,7 @@ from sqlalchemy import select, update
 from app.config import settings
 from app.db import CrawlQueue, SessionLocal, User
 from app.kafka_client import get_producer, make_consumer
+from app.proxy_pool import ProxyPool, _Proxy
 from app.scraper import AuthExpired, InstagramSession, RateLimited, ScrapeError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [worker] %(message)s")
@@ -50,7 +48,7 @@ async def _mark_failed(session, queue_id: int, error: str, requeue_delay_s: int 
     else:
         row.status = "pending"
         row.available_at = datetime.now(timezone.utc) + timedelta(
-            seconds=requeue_delay_s * row.attempts  # simple exponential-ish backoff
+            seconds=requeue_delay_s * row.attempts
         )
     row.locked_by = None
     row.locked_until = None
@@ -75,11 +73,21 @@ async def _mark_completed(session, queue_id: int, user_id: int, duration: float)
     await session.commit()
 
 
-async def handle_job(ig: InstagramSession, producer, job: dict):
+async def handle_job(
+    ig_holder: list[InstagramSession | None],
+    proxy_holder: list[_Proxy | None],
+    proxy_pool: ProxyPool,
+    producer,
+    job: dict,
+):
     queue_id = job["queue_id"]
     user_id = job["user_id"]
     username = job["username"]
     insta_id = job.get("insta_id")
+
+    if not insta_id:
+        log.warning("%s: missing numeric insta_id for job queue_id=%d, skipping", username, queue_id)
+        return
 
     start = time.monotonic()
     async with SessionLocal() as session:
@@ -107,21 +115,48 @@ async def handle_job(ig: InstagramSession, producer, job: dict):
                 )
                 return
 
-            # Claim active worker ownership & renew initial lease
+            # Claim active worker ownership & renew initial DB lease
             row.locked_by = WORKER_ID
             row.locked_until = now + timedelta(seconds=settings.lease_seconds)
             await session.commit()
 
+            # Acquire or verify active proxy lease
+            active_proxy = await proxy_pool.get_proxy()
+            proxy_holder[0] = active_proxy
+            proxy_url = active_proxy.url if active_proxy else None
+
+            # Re-initialize InstagramSession if proxy changed or not created yet
+            current_ig = ig_holder[0]
+            if current_ig is None or current_ig.proxy != proxy_url:
+                if current_ig:
+                    await current_ig.aclose()
+                current_ig = InstagramSession(proxy=proxy_url)
+                ig_holder[0] = current_ig
+
             page_num = 0
-            page_size = 200
+            cursor = None
             chunk_size = settings.worker_message_size
+            total_accounts_crawled = 0
+
+            log.info("Starting GraphQL crawl for %s (id=%s) via proxy=%s", username, insta_id, proxy_url or "direct")
 
             while True:
-                accounts, hasmore = await ig.get_following_page(insta_id, page=page_num, count=page_size)
+                req_start = time.monotonic()
+                accounts, has_next_page, end_cursor = await current_ig.get_following_graphql(
+                    insta_id=insta_id,
+                    after_cursor=cursor,
+                    first=50,
+                )
+                req_duration = time.monotonic() - req_start
 
+                if active_proxy:
+                    active_proxy.record_success(req_duration)
+
+                total_accounts_crawled += len(accounts)
+
+                # Split accounts into chunks and publish to Kafka following-pages
                 for chunk_index, start_idx in enumerate(range(0, len(accounts), chunk_size)):
                     chunk = accounts[start_idx : start_idx + chunk_size]
-
                     await producer.send_and_wait(
                         settings.topic_following_pages,
                         {
@@ -144,79 +179,110 @@ async def handle_job(ig: InstagramSession, producer, job: dict):
                             ],
                         },
                     )
-                    log.info(
-                        "%s: instagram_page=%d chunk=%d accounts=%d done=%s",
-                        username,
-                        page_num,
-                        chunk_index,
-                        len(chunk),
-                        not hasmore,
-                    )
 
-                page_num += 1
+                log.info(
+                    "%s: page=%d accounts=%d has_next=%s cursor=%s (total=%d)",
+                    username,
+                    page_num,
+                    len(accounts),
+                    has_next_page,
+                    (end_cursor[:16] + "...") if end_cursor else None,
+                    total_accounts_crawled,
+                )
 
-                if not hasmore:
+                if not has_next_page or not end_cursor:
                     break
 
-                # Heartbeat: extend lease after each page so long pagination runs don't expire mid-crawl
-                # await session.execute(
-                #     update(CrawlQueue)
-                #     .where(CrawlQueue.id == queue_id, CrawlQueue.locked_by == WORKER_ID)
-                #     .values(locked_until=datetime.now(timezone.utc) + timedelta(seconds=settings.lease_seconds))
-                # )
-                # await session.commit()
+                cursor = end_cursor
+                page_num += 1
 
-            await _mark_completed(session, queue_id, user_id, time.monotonic() - start)
+                # Heartbeat: Touch both DB job lease and proxy lease during long crawls
+                await session.execute(
+                    update(CrawlQueue)
+                    .where(CrawlQueue.id == queue_id, CrawlQueue.locked_by == WORKER_ID)
+                    .values(locked_until=datetime.now(timezone.utc) + timedelta(seconds=settings.lease_seconds))
+                )
+                await session.commit()
+
+                if active_proxy:
+                    active_proxy = await proxy_pool.get_proxy()
+                    proxy_holder[0] = active_proxy
+
+            duration = time.monotonic() - start
+            await _mark_completed(session, queue_id, user_id, duration)
+            log.info("Finished crawl for %s: %d total accounts in %.1fs", username, total_accounts_crawled, duration)
 
         except RateLimited as e:
-            log.warning("rate limited on %s: %s", username, e)
+            log.warning("Rate limited on %s: %s", username, e)
             await session.rollback()
+            if proxy_holder[0]:
+                proxy_holder[0].bench_immediately(reason=f"rate_limited: {e}")
+                proxy_pool.release_proxy(proxy_holder[0])
+                proxy_holder[0] = None
+            if ig_holder[0]:
+                await ig_holder[0].aclose()
+                ig_holder[0] = None
             await _mark_failed(session, queue_id, str(e), requeue_delay_s=300)
+
         except AuthExpired as e:
-            log.error("auth expired: %s — refresh IG_SESSIONID and restart the worker", e)
+            log.error("Auth expired: %s — refresh IG_SESSIONID and restart the worker", e)
             await session.rollback()
             await _mark_failed(session, queue_id, str(e), requeue_delay_s=600)
-            raise  # no point continuing this worker with a dead session
+            raise
+
         except ScrapeError as e:
-            log.warning("scrape error on %s: %s", username, e)
+            log.warning("Scrape error on %s: %s", username, e)
             await session.rollback()
+            if proxy_holder[0]:
+                proxy_holder[0].record_failure(reason=f"scrape_error: {e}")
             await _mark_failed(session, queue_id, str(e))
-        except Exception as e:  # noqa: BLE001 — POC-grade catch-all so one bad job doesn't kill the worker
-            log.exception("unexpected error on %s", username)
+
+        except Exception as e:
+            log.exception("Unexpected error on %s", username)
             await session.rollback()
+            if proxy_holder[0]:
+                proxy_holder[0].record_failure(reason=f"unexpected_error: {e}")
             await _mark_failed(session, queue_id, repr(e))
 
 
-async def run(proxy: str | None = None):
-    effective_proxy = proxy or settings.worker_proxy or None
-    if effective_proxy:
-        log.info("Starting worker with proxy: %s", effective_proxy)
-    else:
-        log.info("Starting worker without proxy (direct connection)")
+async def run(override_proxy: str | None = None):
+    log.info("Starting Instagram GraphQL Crawl Worker [%s]...", WORKER_ID)
 
-    ig = InstagramSession(proxy=effective_proxy)
+    proxy_pool = ProxyPool(state_file=settings.worker_proxy_state_file)
+    ig_holder: list[InstagramSession | None] = [None]
+    proxy_holder: list[_Proxy | None] = [None]
+
+    if override_proxy:
+        log.info("Using CLI override proxy: %s", override_proxy)
+        ig_holder[0] = InstagramSession(proxy=override_proxy)
+
     consumer = make_consumer(settings.topic_crawl_jobs, group_id="workers")
     await consumer.start()
+
     try:
         async with get_producer() as producer:
+            log.info("Worker listening for crawl jobs on topic '%s'...", settings.topic_crawl_jobs)
             async for msg in consumer:
                 job = msg.value
-                await handle_job(ig, producer, job)
+                await handle_job(ig_holder, proxy_holder, proxy_pool, producer, job)
                 await consumer.commit()
     finally:
         await consumer.stop()
-        await ig.aclose()
+        if ig_holder[0]:
+            await ig_holder[0].aclose()
+        await proxy_pool.aclose()
+        log.info("Worker [%s] shutdown cleanly.", WORKER_ID)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Instagram Crawl Worker")
+    parser = argparse.ArgumentParser(description="Instagram GraphQL Crawl Worker")
     parser.add_argument(
         "--proxy",
         type=str,
         default=None,
-        help="Proxy URL (e.g. socks5://127.0.0.1:2080 or http://127.0.0.1:8080). Overrides WORKER_PROXY environment variable.",
+        help="Override proxy URL (e.g. socks5://127.0.0.1:2080). Overrides shared proxy pool.",
     )
     args = parser.parse_args()
-    asyncio.run(run(proxy=args.proxy))
+    asyncio.run(run(override_proxy=args.proxy))
