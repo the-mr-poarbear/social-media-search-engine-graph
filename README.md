@@ -17,6 +17,9 @@
 
 ## Overview
 
+<img width="570" height="304" alt="In App Footage" src="https://github.com/user-attachments/assets/de33cf3f-f5b1-4740-85e7-8cf41ab22dd5" />
+
+
 Mapping and analyzing large-scale social networks is notoriously difficult. Social platforms enforce stringent rate limits, deploy aggressive bot detection, and present massive graph densities where single profiles can branch into tens of thousands of connections. Traditional single-process scrapers quickly get rate-limited, stall on API lookups, or crash under the memory overhead of rendering millions of graph relationships.
 
 **SocialGraph Engine** solves these challenges through a distributed, decoupled, and event-driven architecture designed to discover, crawl, enrich, and visualize large-scale follower networks:
